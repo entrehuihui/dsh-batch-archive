@@ -48,6 +48,8 @@ window.__ModuleLoader__.load({
 .bx-dialogTitle{margin:0;font-size:14px;font-weight:600}
 .bx-dialogBody{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary)}
 .bx-dialogActions{display:flex;justify-content:flex-end;gap:8px}
+.bx-activity{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:3px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);max-height:180px;overflow:auto}
+.bx-activityId{color:var(--dsw-alias-label-primary)}
 .bx-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 `;
 
@@ -73,9 +75,31 @@ window.__ModuleLoader__.load({
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     }
 
-    function isActiveRefusal(reason) {
-      return !!reason && typeof reason === 'object' && reason.name === 'WorkspaceArchiveError'
-        && !!reason.rpcError && reason.rpcError.code === 'workspace/session-active';
+    // Host refusal carries the concrete work in progress; `undefined` means
+    // "some other failure". Class identity goes by name: plugin bundles do not
+    // share error-class identity with the Host.
+    function activeRefusalActivity(reason) {
+      if (!reason || typeof reason !== 'object') return void 0;
+      if (reason.name !== 'WorkspaceArchiveError') return void 0;
+      const rpc = reason.rpcError;
+      if (!rpc || rpc.code !== 'workspace/session-active') return void 0;
+      return (rpc.details && rpc.details.activity) || [];
+    }
+
+    // One activity family -> one line. Mirrors the Host UI wording so the same
+    // refusal reads the same way in both panels.
+    function activityLine(entry, t) {
+      const items = entry.items || [];
+      const n = items.length;
+      const names = items.map((item) => item.label || item.id).join(t('activity.sep'));
+      const plural = n === 1 ? 'one' : 'other';
+      switch (entry.kind) {
+        case 'turn': return t('activity.turn');
+        case 'subagent': return t(`activity.subagents.${plural}`, { n, names });
+        case 'job': return t(`activity.jobs.${plural}`, { n, names });
+        case 'schedule': return t(`activity.schedules.${plural}`, { n, names });
+        default: return t(`activity.other.${plural}`, { kind: entry.kind, n });
+      }
     }
 
     function PanelIcon({ size }) {
@@ -90,8 +114,9 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    function SessionRow({ row, checked, failed, current, onToggle, t, now }) {
-      return h('label', {
+    function SessionRow({ row, checked, failed, current, onToggle, onOpen, t, now }) {
+      const title = row.displayTitle || t('row.blank');
+      return h('div', {
         className: 'bx-row',
         'data-current': current ? 'true' : 'false',
         'data-failed': failed ? 'true' : 'false',
@@ -99,10 +124,14 @@ window.__ModuleLoader__.load({
         h('input', {
           key: 'check', type: 'checkbox', className: 'bx-check',
           checked, onChange: () => onToggle(row.id),
-          'aria-label': t('row.select', { name: row.displayTitle }),
+          'aria-label': t('row.select', { name: title }),
         }),
-        h('span', { key: 'body', className: 'bx-rowBody' }, [
-          h('span', { key: 'title', className: 'bx-rowTitle' }, row.displayTitle),
+        h('button', {
+          key: 'body', type: 'button', className: 'bx-rowBody',
+          onClick: () => onOpen(row.id),
+          title: t('action.open'),
+        }, [
+          h('span', { key: 'title', className: 'bx-rowTitle' }, title),
           h('span', { key: 'meta', className: 'bx-rowMeta' }, [
             row.running
               ? h('span', { key: 'run', className: 'bx-tag', 'data-kind': 'running' },
@@ -142,10 +171,10 @@ window.__ModuleLoader__.load({
         const needle = query.trim().toLowerCase();
         return list.ids
           .map((id) => list.byId[id])
-          .filter((row) => row !== void 0 && !row.blank)
+          .filter((row) => row !== void 0)
           .filter((row) => (tab === 'archived' ? archivedSet.has(row.id) : !archivedSet.has(row.id)))
           .filter((row) => needle === ''
-            || row.displayTitle.toLowerCase().includes(needle)
+            || (row.displayTitle || '').toLowerCase().includes(needle)
             || (row.cwd || '').toLowerCase().includes(needle))
           .sort((a, b) => b.updatedAt - a.updatedAt);
       }, [list, tab, query, archivedSet]);
@@ -156,15 +185,14 @@ window.__ModuleLoader__.load({
         [visibleIds, checked],
       );
 
-      // Drop selections that left the visible set (archived elsewhere, filtered out).
-      useEffect(() => {
-        if (checked.size === 0) return;
-        const live = new Set(visibleIds);
-        let changed = false;
-        const next = new Set();
-        checked.forEach((id) => { if (live.has(id)) next.add(id); else changed = true; });
-        if (changed) setChecked(next);
-      }, [visibleIds, checked]);
+      // Selections are kept across filtering and tab switches on purpose: the
+      // user ticked them, so only the user may untick them. The action itself
+      // always runs over the visible subset (checkedVisible), so a hidden tick
+      // can never be archived by surprise.
+      const hiddenChecked = useMemo(
+        () => [...checked].filter((id) => !visibleIds.includes(id)).length,
+        [checked, visibleIds],
+      );
 
       const toggle = useCallback((id) => {
         setChecked((prev) => {
@@ -175,11 +203,24 @@ window.__ModuleLoader__.load({
         setFailed((prev) => { if (!prev.has(id)) return prev; const n = new Set(prev); n.delete(id); return n; });
       }, []);
 
-      const selectAll = useCallback(() => setChecked(new Set(visibleIds)), [visibleIds]);
+      const selectAll = useCallback(() => {
+        // Add the visible range to whatever is already ticked: narrowing the
+        // search must never silently drop an earlier selection.
+        setChecked((prev) => {
+          const next = new Set(prev);
+          visibleIds.forEach((id) => next.add(id));
+          return next;
+        });
+      }, [visibleIds]);
       const selectNone = useCallback(() => setChecked(new Set()), []);
       const invert = useCallback(() => {
-        setChecked(new Set(visibleIds.filter((id) => !checked.has(id))));
-      }, [visibleIds, checked]);
+        // Invert only the visible range; leave hidden ticks untouched.
+        setChecked((prev) => {
+          const next = new Set(prev);
+          visibleIds.forEach((id) => { if (next.has(id)) next.delete(id); else next.add(id); });
+          return next;
+        });
+      }, [visibleIds]);
 
       const runBatch = useCallback(async (ids, stopActivity) => {
         if (ids.length === 0 || busy !== null) return;
@@ -193,8 +234,14 @@ window.__ModuleLoader__.load({
             else await onUnarchive(id);
             setBusy({ done: i + 1, total: ids.length, archiving });
           } catch (reason) {
-            if (archiving && isActiveRefusal(reason)) {
-              setPendingActive({ ids: ids.slice(i), reason });
+            const activity = archiving ? activeRefusalActivity(reason) : void 0;
+            if (activity !== void 0) {
+              const titles = {};
+              ids.forEach((sid) => {
+                const row = list.byId[sid];
+                titles[sid] = row ? (row.displayTitle || t('row.blank')) : sid;
+              });
+              setPendingActive({ ids: ids.slice(i), activity, titles });
               setBusy(null);
               return;
             }
@@ -203,7 +250,13 @@ window.__ModuleLoader__.load({
           }
         }
         setBusy(null);
-        setChecked(new Set());
+        // Only clear the rows this run actually touched; ticks the user made in
+        // another tab or under another filter must survive.
+        setChecked((prev) => {
+          const next = new Set(prev);
+          ids.forEach((sid) => next.delete(sid));
+          return next;
+        });
         setFailed(new Set(failedIds));
         const okCount = ids.length - failedIds.length;
         if (failedIds.length === 0) {
@@ -215,7 +268,7 @@ window.__ModuleLoader__.load({
             ? t('action.archiveFailed', { count: failedIds.length })
             : t('action.unarchiveFailed', { count: failedIds.length }));
         }
-      }, [busy, tab, onArchive, onUnarchive, t]);
+      }, [busy, tab, onArchive, onUnarchive, t, list]);
 
       const onPrimary = useCallback(() => {
         void runBatch(checkedVisible, false);
@@ -230,8 +283,10 @@ window.__ModuleLoader__.load({
       const retryFailed = useCallback(() => {
         const ids = [...failed];
         if (ids.length === 0) return;
-        void runBatch(ids, tab !== 'archived');
-      }, [failed, runBatch, tab]);
+        // Never pass stopActivity here: a retry must go through the same
+        // confirmation gate as a first attempt, so nothing is stopped silently.
+        void runBatch(ids, false);
+      }, [failed, runBatch]);
 
       const switchTab = useCallback((next) => {
         setTab(next);
@@ -269,6 +324,10 @@ window.__ModuleLoader__.load({
             checkedVisible.length > 0
               ? t('count.selected', { count: checkedVisible.length })
               : t('count.none')),
+          hiddenChecked > 0
+            ? h('span', { key: 'hidden', className: 'bx-count', title: t('count.hiddenHint') },
+                t('count.hidden', { count: hiddenChecked }))
+            : null,
           h('button', {
             key: 'all', type: 'button', className: 'bx-btn', onClick: selectAll,
             disabled: rows.length === 0 || allChecked,
@@ -306,6 +365,7 @@ window.__ModuleLoader__.load({
                 failed: failed.has(row.id),
                 current: row.id === currentId,
                 onToggle: toggle,
+                onOpen,
               }))),
         h('div', { key: 'foot', className: 'bx-foot', role: 'status', 'aria-live': 'polite' }, notice),
         pendingActive !== null
@@ -314,7 +374,16 @@ window.__ModuleLoader__.load({
               onClick: (e) => { if (e.target === e.currentTarget) setPendingActive(null); },
             }, h('div', { className: 'bx-dialog', role: 'dialog', 'aria-modal': true }, [
               h('h3', { key: 't', className: 'bx-dialogTitle' }, t('confirm.activeTitle')),
-              h('p', { key: 'b', className: 'bx-dialogBody' }, t('confirm.activeBody', { count: pendingActive.ids.length })),
+              h('p', { key: 'b', className: 'bx-dialogBody' }, t('confirm.activeBody')),
+              pendingActive.activity.length > 0
+                ? h('ul', { key: 'act', className: 'bx-activity' },
+                    pendingActive.activity.map((entry, i) =>
+                      h('li', { key: `${entry.kind}-${i}` }, activityLine(entry, t))))
+                : null,
+              h('p', { key: 'l', className: 'bx-dialogBody' }, t('confirm.activeList')),
+              h('ul', { key: 'ids', className: 'bx-activity' },
+                pendingActive.ids.map((id) => h('li', { key: id, className: 'bx-activityId' },
+                  pendingActive.titles[id] || id))),
               h('div', { key: 'a', className: 'bx-dialogActions' }, [
                 h('button', {
                   key: 'c', type: 'button', className: 'bx-btn',
@@ -344,6 +413,8 @@ window.__ModuleLoader__.load({
             'header.emptyHint': '当前工作区还没有会话记录。',
             'count.selected': '已选 {count} 个',
             'count.none': '点击左侧复选框选择会话',
+            'count.hidden': '另有 {count} 个已选未显示',
+            'count.hiddenHint': '这些勾选被当前的搜索或标签页遮住了，归档只作用于当前可见项',
             'filter.search': '搜索标题或目录',
             'action.selectAll': '全选',
             'action.selectNone': '取消全选',
@@ -360,13 +431,24 @@ window.__ModuleLoader__.load({
             'action.retry': '重试失败项',
             'action.open': '打开',
             'confirm.activeTitle': '有会话正在运行',
-            'confirm.activeBody': '以下 {count} 个会话还有未完成的工作，归档前会先停止它们。',
+            'confirm.activeBody': '以下会话还有未完成的工作，归档前会先停止它们。',
+            'confirm.activeList': '将被停止的会话：',
             'confirm.cancel': '取消',
             'confirm.confirm': '停止并归档',
+            'activity.turn': '进行中的回合',
+            'activity.subagents.one': '{n} 个运行中的子智能体：{names}',
+            'activity.subagents.other': '{n} 个运行中的子智能体：{names}',
+            'activity.jobs.one': '{n} 个后台任务：{names}',
+            'activity.jobs.other': '{n} 个后台任务：{names}',
+            'activity.schedules.one': '{n} 条定时提醒：{names}',
+            'activity.schedules.other': '{n} 条定时提醒：{names}',
+            'activity.other.one': '{n} 项其他工作（{kind}）',
+            'activity.other.other': '{n} 项其他工作（{kind}）',
+            'activity.sep': '、',
             'error.generic': '操作失败，请重试。',
             'row.running': '运行中',
             'row.blank': '新会话',
-            'row.select': '选择会话',
+            'row.select': '选择会话：{name}',
             'row.updated': '更新于 {time}',
           },
           en: {
@@ -378,6 +460,8 @@ window.__ModuleLoader__.load({
             'header.emptyHint': 'This workspace has no session records yet.',
             'count.selected': '{count} selected',
             'count.none': 'Tick the checkbox to select sessions',
+            'count.hidden': '+{count} selected but hidden',
+            'count.hiddenHint': 'These ticked sessions are hidden by the current search or tab; archiving only affects visible rows',
             'filter.search': 'Search title or directory',
             'action.selectAll': 'Select all',
             'action.selectNone': 'Clear',
@@ -394,13 +478,24 @@ window.__ModuleLoader__.load({
             'action.retry': 'Retry failed',
             'action.open': 'Open',
             'confirm.activeTitle': 'Sessions still running',
-            'confirm.activeBody': 'These {count} sessions still have running work, which will be stopped before archiving.',
+            'confirm.activeBody': 'These sessions still have work in progress, which will be stopped before archiving.',
+            'confirm.activeList': 'Sessions to be stopped:',
             'confirm.cancel': 'Cancel',
             'confirm.confirm': 'Stop and archive',
+            'activity.turn': 'The turn in progress',
+            'activity.subagents.one': '{n} running subagent: {names}',
+            'activity.subagents.other': '{n} running subagents: {names}',
+            'activity.jobs.one': '{n} background job: {names}',
+            'activity.jobs.other': '{n} background jobs: {names}',
+            'activity.schedules.one': '{n} scheduled reminder: {names}',
+            'activity.schedules.other': '{n} scheduled reminders: {names}',
+            'activity.other.one': '{n} other item of work ({kind})',
+            'activity.other.other': '{n} other items of work ({kind})',
+            'activity.sep': ', ',
             'error.generic': 'Failed, please retry.',
             'row.running': 'Running',
             'row.blank': 'New session',
-            'row.select': 'Select session',
+            'row.select': 'Select session: {name}',
             'row.updated': 'Updated {time}',
           },
         }), 'batch-archive: dictionaries');
