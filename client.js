@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
 .bx-btn[data-variant="danger"]{color:var(--dsw-alias-state-error-primary)}
 .bx-list{flex:1;min-height:0;overflow:auto;padding:6px 12px 20px}
 .bx-empty{display:flex;flex-direction:column;gap:4px;align-items:center;justify-content:center;height:100%;color:var(--dsw-alias-label-secondary);font-size:13px;text-align:center;padding:24px}
-.bx-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px}
+.bx-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;cursor:pointer}
 .bx-row:hover{background:var(--dsw-alias-bg-layer-1)}
 .bx-row[data-current="true"]{background:var(--dsw-alias-bg-layer-2)}
 .bx-row[data-failed="true"] .bx-rowTitle{color:var(--dsw-alias-state-error-primary)}
@@ -121,23 +121,28 @@ window.__ModuleLoader__.load({
 
     function SessionRow({ row, checked, failed, current, onToggle, onOpen, t, now }) {
       const title = row.displayTitle || t('row.blank');
-      const busy = isBusy(row);
+      const busy = row.busy;
+      // A label wrapper would be invalid around a nested button, so the row is a
+      // div that forwards clicks on its own whitespace to the checkbox. The
+      // title button stops propagation so opening a session never toggles it.
       return h('div', {
         className: 'bx-row',
         'data-current': current ? 'true' : 'false',
         'data-failed': failed ? 'true' : 'false',
         'data-busy': busy ? 'true' : 'false',
+        onClick: () => onToggle(row.id),
       }, [
         h('input', {
           key: 'check', type: 'checkbox', className: 'bx-check',
           checked, disabled: busy,
           onChange: () => onToggle(row.id),
+          onClick: (e) => e.stopPropagation(),
           'aria-label': busy ? t('row.selectBusy', { name: title }) : t('row.select', { name: title }),
           title: busy ? t('row.selectBusyHint') : undefined,
         }),
         h('button', {
           key: 'body', type: 'button', className: 'bx-rowBody',
-          onClick: () => onOpen(row.id),
+          onClick: (e) => { e.stopPropagation(); onOpen(row.id); },
           title: t('action.open'),
         }, [
           h('span', { key: 'title', className: 'bx-rowTitle' }, title),
@@ -145,6 +150,13 @@ window.__ModuleLoader__.load({
             row.running
               ? h('span', { key: 'run', className: 'bx-tag', 'data-kind': 'running' },
                   h('span', { key: 'd', className: 'bx-dot' }), t('row.running'))
+              : null,
+            // Busy for a reason other than the turn itself: a pending question,
+            // or a status baseline that differs from the list row.
+            busy && !row.running
+              ? h('span', { key: 'wait', className: 'bx-tag', 'data-kind': 'running' },
+                  h('span', { key: 'd', className: 'bx-dot' }),
+                  row.waiting ? t('row.waitingAnswer') : t('row.busy'))
               : null,
             row.blank ? h('span', { key: 'blank', className: 'bx-tag' }, t('row.blank')) : null,
             failed ? h('span', { key: 'fail', className: 'bx-tag', 'data-kind': 'failed' }, t('error.generic')) : null,
@@ -154,20 +166,40 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    // A session counts as busy when anything of it is still in flight: the turn
-    // itself, a running subagent, or a pending interaction. This mirrors the
-    // Host UI's live-status rule, so "busy" means the same thing in both places.
-    function isBusy(row) {
-      return !!row.running
-        || (row.runningSubagentCount || 0) > 0
-        || row.pendingInteraction !== void 0;
+    // Busy means "something of this session is in flight, so archiving it would
+    // stop real work". The authoritative source is the unified Session status
+    // (ctx side: dsh-client-ui-session's sessionStatus), NOT the list summary:
+    // SessionSummary carries only `running`, never a subagent count or a pending
+    // interaction. `useSessionStatus` is a slot standard prop, so it is injected
+    // the same way as `useSessions`.
+    //
+    // runningSubagentCount is deliberately not consulted: it exists only on the
+    // Workspace tree's SessionNode, derived per render from the private
+    // `runningChildCount(list, id, statuses)` helper. The Host itself refuses to
+    // archive a session whose subagents are still running, and that refusal
+    // surfaces through the activity dialog, so the UI stays honest without
+    // re-deriving a value it cannot see.
+    function isBusy(row, status) {
+      if (status !== void 0) {
+        if (status.running === true) return true;
+        if (status.pendingInteraction !== void 0) return true;
+        return false;
+      }
+      // Before the status stream establishes a baseline, fall back to the list
+      // row so a plainly running session is never offered for bulk archiving.
+      return !!row.running;
     }
 
     function BatchArchivePanel(props) {
-      const { t, useSessions, useArchived, useCurrentSession, onArchive, onUnarchive, onOpen } = props;
+      const {
+        t, useSessions, useSessionStatus, useArchived, useCurrentSession, useNotice,
+        onArchive, onUnarchive, onOpen,
+      } = props;
       const list = useSessions((s) => s);
+      const statuses = useSessionStatus((s) => s);
       const archived = useArchived((s) => s);
       const currentId = useCurrentSession((s) => s);
+      const openNotice = useNotice((s) => s);
       const [tab, setTab] = useState('active');
       const [query, setQuery] = useState('');
       const [checked, setChecked] = useState(() => new Set());
@@ -194,14 +226,22 @@ window.__ModuleLoader__.load({
           .filter((row) => needle === ''
             || (row.displayTitle || '').toLowerCase().includes(needle)
             || (row.cwd || '').toLowerCase().includes(needle))
-          .sort((a, b) => b.updatedAt - a.updatedAt);
-      }, [list, tab, query, archivedSet]);
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .map((row) => {
+            const status = statuses === void 0 ? void 0 : statuses.get(row.id);
+            return {
+              ...row,
+              busy: isBusy(row, status),
+              waiting: status !== void 0 && status.pendingInteraction !== void 0,
+            };
+          });
+      }, [list, tab, query, archivedSet, statuses]);
 
       const visibleIds = useMemo(() => rows.map((r) => r.id), [rows]);
       // Only idle rows may be selected: archiving a busy session would stop its
       // work, so it is not offered as a bulk target at all.
       const selectableIds = useMemo(
-        () => rows.filter((row) => !isBusy(row)).map((row) => row.id),
+        () => rows.filter((row) => !row.busy).map((row) => row.id),
         [rows],
       );
       const checkedVisible = useMemo(
@@ -214,8 +254,10 @@ window.__ModuleLoader__.load({
       // back; the count and the action both read from selectableIds.
       useEffect(() => {
         const busyTicked = [...checked].filter((id) => {
+          const status = statuses === void 0 ? void 0 : statuses.get(id);
           const row = list.byId[id];
-          return row !== void 0 && isBusy(row);
+          if (row === void 0 && status === void 0) return false;
+          return isBusy(row || {}, status);
         });
         if (busyTicked.length === 0) return;
         setChecked((prev) => {
@@ -223,7 +265,7 @@ window.__ModuleLoader__.load({
           busyTicked.forEach((id) => next.delete(id));
           return next;
         });
-      }, [checked, list]);
+      }, [checked, list, statuses]);
 
       // Selections are kept across filtering and tab switches on purpose: the
       // user ticked them, so only the user may untick them. The action itself
@@ -237,15 +279,16 @@ window.__ModuleLoader__.load({
       const toggle = useCallback((id) => {
         // Rows in flight cannot be ticked; the checkbox is disabled for them too,
         // this guard covers programmatic hits (keyboard, assistive tech).
+        const status = statuses === void 0 ? void 0 : statuses.get(id);
         const row = list.byId[id];
-        if (row !== void 0 && isBusy(row)) return;
+        if ((row !== void 0 || status !== void 0) && isBusy(row || {}, status)) return;
         setChecked((prev) => {
           const next = new Set(prev);
           if (next.has(id)) next.delete(id); else next.add(id);
           return next;
         });
         setFailed((prev) => { if (!prev.has(id)) return prev; const n = new Set(prev); n.delete(id); return n; });
-      }, [list]);
+      }, [list, statuses]);
 
       const selectAll = useCallback(() => {
         // Add the selectable visible range to whatever is already ticked:
@@ -256,7 +299,16 @@ window.__ModuleLoader__.load({
           return next;
         });
       }, [selectableIds]);
-      const selectNone = useCallback(() => setChecked(new Set()), []);
+      // Clear only what the user can see, matching selectAll/invert: a tick made
+      // under another filter or tab must not vanish without ever being shown.
+      const selectNone = useCallback(() => {
+        setChecked((prev) => {
+          if (prev.size === 0) return prev;
+          const next = new Set(prev);
+          visibleIds.forEach((id) => next.delete(id));
+          return next;
+        });
+      }, [visibleIds]);
       const invert = useCallback(() => {
         // Invert only the selectable visible range; busy rows stay unticked and
         // hidden ticks are left untouched.
@@ -415,7 +467,8 @@ window.__ModuleLoader__.load({
                 onToggle: toggle,
                 onOpen,
               }))),
-        h('div', { key: 'foot', className: 'bx-foot', role: 'status', 'aria-live': 'polite' }, notice),
+        h('div', { key: 'foot', className: 'bx-foot', role: 'status', 'aria-live': 'polite' },
+          notice || openNotice),
         pendingActive !== null
           ? h('div', {
               key: 'confirm', className: 'bx-overlay',
@@ -476,7 +529,6 @@ window.__ModuleLoader__.load({
             'action.unarchiveDone': '已恢复 {count} 个会话',
             'action.archiveFailed': '有 {count} 个会话没能归档',
             'action.unarchiveFailed': '有 {count} 个会话没能恢复',
-            'action.stopAndArchive': '停止并归档',
             'action.retry': '重试失败项',
             'action.open': '打开',
             'confirm.activeTitle': '有会话正在运行',
@@ -494,8 +546,11 @@ window.__ModuleLoader__.load({
             'activity.other.one': '{n} 项其他工作（{kind}）',
             'activity.other.other': '{n} 项其他工作（{kind}）',
             'activity.sep': '、',
+            'toast.archivedNotOpenable': '已归档对话暂时无法查看，请取消归档后查看',
             'error.generic': '操作失败，请重试。',
             'row.running': '运行中',
+            'row.busy': '忙碌中',
+            'row.waitingAnswer': '等待回复',
             'row.blank': '新会话',
             'row.select': '选择会话：{name}',
             'row.selectBusy': '运行中的会话无法选择：{name}',
@@ -526,7 +581,6 @@ window.__ModuleLoader__.load({
             'action.unarchiveDone': 'Restored {count} sessions',
             'action.archiveFailed': '{count} sessions could not be archived',
             'action.unarchiveFailed': '{count} sessions could not be restored',
-            'action.stopAndArchive': 'Stop and archive',
             'action.retry': 'Retry failed',
             'action.open': 'Open',
             'confirm.activeTitle': 'Sessions still running',
@@ -544,8 +598,11 @@ window.__ModuleLoader__.load({
             'activity.other.one': '{n} other item of work ({kind})',
             'activity.other.other': '{n} other items of work ({kind})',
             'activity.sep': ', ',
+            'toast.archivedNotOpenable': 'Archived sessions cannot be opened. Unarchive it to view.',
             'error.generic': 'Failed, please retry.',
             'row.running': 'Running',
+            'row.busy': 'Busy',
+            'row.waitingAnswer': 'Awaiting answer',
             'row.blank': 'New session',
             'row.select': 'Select session: {name}',
             'row.selectBusy': 'Running session cannot be selected: {name}',
@@ -573,16 +630,50 @@ window.__ModuleLoader__.load({
           subscribe: (listener) => sessionList.subscribe(listener),
         };
 
+        // Set when an archived session is clicked; the panel shows it in its
+        // status footer, the same place batch results appear.
+        let noticeValue = '';
+        const noticeListeners = new Set();
+        const openArchivedNotice = {
+          getSnapshot: () => noticeValue,
+          subscribe: (listener) => {
+            noticeListeners.add(listener);
+            return () => { noticeListeners.delete(listener); };
+          },
+          set: (next) => {
+            if (noticeValue === next) return;
+            noticeValue = next;
+            noticeListeners.forEach((listener) => listener());
+          },
+        };
+
         const onArchive = async (id, options) => { await ctx.uiWorkspace.archiveSession(id, options); };
         const onUnarchive = async (id) => { await ctx.uiWorkspace.unarchiveSession(id); };
-        const onOpen = (id) => { ctx.uiWorkspace.openSession(id); };
+        // uiWorkspace.openSession is a bare navigation call: it performs no
+        // archived check. The Host UI guards this itself (WorkspaceBrowser's
+        // guardedOpen) and shows a warning toast instead of navigating. Plugin
+        // code talks to the service directly, so that layer is skipped and the
+        // guard has to be reproduced here.
+        const onOpen = (id) => {
+          const archivedIds = ctx.workspaces.list.getSnapshot().archivedSessionIds;
+          if (archivedIds.includes(id)) {
+            openArchivedNotice.set(t('toast.archivedNotOpenable'));
+            window.setTimeout(() => openArchivedNotice.set(''), 4000);
+            return;
+          }
+          ctx.uiWorkspace.openSession(id);
+        };
 
         const injectProps = () => ({
           t,
-          hooks: { sessions: sessionList, archived: archivedSet, current: currentSession },
+          hooks: {
+            sessions: sessionList, archived: archivedSet,
+            current: currentSession, notice: openArchivedNotice,
+          },
           useSessions: (selector) => useSnapshot(sessionList, selector),
           useArchived: (selector) => useSnapshot(archivedSet, selector),
           useCurrentSession: (selector) => useSnapshot(currentSession, selector),
+          useNotice: (selector) => useSnapshot(openArchivedNotice, selector),
           onArchive, onUnarchive, onOpen,
         });
 
