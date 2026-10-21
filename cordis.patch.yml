@@ -1,0 +1,4 @@
+- insert:
+    - id: batch-archive
+      name: '@local/batch-archive'
+      config: {}
