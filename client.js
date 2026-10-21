@@ -34,6 +34,9 @@ window.__ModuleLoader__.load({
 .bx-row[data-current="true"]{background:var(--dsw-alias-bg-layer-2)}
 .bx-row[data-failed="true"] .bx-rowTitle{color:var(--dsw-alias-state-error-primary)}
 .bx-check{flex:none;width:15px;height:15px;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
+.bx-check:disabled{cursor:not-allowed;opacity:.45}
+.bx-row[data-busy="true"]{cursor:default}
+.bx-row[data-busy="true"] .bx-rowTitle{color:var(--dsw-alias-label-secondary)}
 .bx-rowBody{flex:1;min-width:0;display:flex;flex-direction:column;align-items:stretch;gap:2px;appearance:none;background:transparent;border:0;padding:0;margin:0;font:inherit;color:inherit;text-align:left;cursor:pointer;border-radius:6px}
 .bx-rowBody:hover .bx-rowTitle{color:var(--dsw-alias-brand-primary)}
 .bx-rowBody:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
@@ -118,15 +121,19 @@ window.__ModuleLoader__.load({
 
     function SessionRow({ row, checked, failed, current, onToggle, onOpen, t, now }) {
       const title = row.displayTitle || t('row.blank');
+      const busy = isBusy(row);
       return h('div', {
         className: 'bx-row',
         'data-current': current ? 'true' : 'false',
         'data-failed': failed ? 'true' : 'false',
+        'data-busy': busy ? 'true' : 'false',
       }, [
         h('input', {
           key: 'check', type: 'checkbox', className: 'bx-check',
-          checked, onChange: () => onToggle(row.id),
-          'aria-label': t('row.select', { name: title }),
+          checked, disabled: busy,
+          onChange: () => onToggle(row.id),
+          'aria-label': busy ? t('row.selectBusy', { name: title }) : t('row.select', { name: title }),
+          title: busy ? t('row.selectBusyHint') : undefined,
         }),
         h('button', {
           key: 'body', type: 'button', className: 'bx-rowBody',
@@ -145,6 +152,15 @@ window.__ModuleLoader__.load({
           ]),
         ]),
       ]);
+    }
+
+    // A session counts as busy when anything of it is still in flight: the turn
+    // itself, a running subagent, or a pending interaction. This mirrors the
+    // Host UI's live-status rule, so "busy" means the same thing in both places.
+    function isBusy(row) {
+      return !!row.running
+        || (row.runningSubagentCount || 0) > 0
+        || row.pendingInteraction !== void 0;
     }
 
     function BatchArchivePanel(props) {
@@ -182,10 +198,32 @@ window.__ModuleLoader__.load({
       }, [list, tab, query, archivedSet]);
 
       const visibleIds = useMemo(() => rows.map((r) => r.id), [rows]);
-      const checkedVisible = useMemo(
-        () => visibleIds.filter((id) => checked.has(id)),
-        [visibleIds, checked],
+      // Only idle rows may be selected: archiving a busy session would stop its
+      // work, so it is not offered as a bulk target at all.
+      const selectableIds = useMemo(
+        () => rows.filter((row) => !isBusy(row)).map((row) => row.id),
+        [rows],
       );
+      const checkedVisible = useMemo(
+        () => selectableIds.filter((id) => checked.has(id)),
+        [selectableIds, checked],
+      );
+
+      // A session ticked while idle can start running before the batch fires.
+      // Drop those ticks so a busy session is never archived behind the user's
+      // back; the count and the action both read from selectableIds.
+      useEffect(() => {
+        const busyTicked = [...checked].filter((id) => {
+          const row = list.byId[id];
+          return row !== void 0 && isBusy(row);
+        });
+        if (busyTicked.length === 0) return;
+        setChecked((prev) => {
+          const next = new Set(prev);
+          busyTicked.forEach((id) => next.delete(id));
+          return next;
+        });
+      }, [checked, list]);
 
       // Selections are kept across filtering and tab switches on purpose: the
       // user ticked them, so only the user may untick them. The action itself
@@ -197,32 +235,37 @@ window.__ModuleLoader__.load({
       );
 
       const toggle = useCallback((id) => {
+        // Rows in flight cannot be ticked; the checkbox is disabled for them too,
+        // this guard covers programmatic hits (keyboard, assistive tech).
+        const row = list.byId[id];
+        if (row !== void 0 && isBusy(row)) return;
         setChecked((prev) => {
           const next = new Set(prev);
           if (next.has(id)) next.delete(id); else next.add(id);
           return next;
         });
         setFailed((prev) => { if (!prev.has(id)) return prev; const n = new Set(prev); n.delete(id); return n; });
-      }, []);
+      }, [list]);
 
       const selectAll = useCallback(() => {
-        // Add the visible range to whatever is already ticked: narrowing the
-        // search must never silently drop an earlier selection.
+        // Add the selectable visible range to whatever is already ticked:
+        // narrowing the search must never silently drop an earlier selection.
         setChecked((prev) => {
           const next = new Set(prev);
-          visibleIds.forEach((id) => next.add(id));
+          selectableIds.forEach((id) => next.add(id));
           return next;
         });
-      }, [visibleIds]);
+      }, [selectableIds]);
       const selectNone = useCallback(() => setChecked(new Set()), []);
       const invert = useCallback(() => {
-        // Invert only the visible range; leave hidden ticks untouched.
+        // Invert only the selectable visible range; busy rows stay unticked and
+        // hidden ticks are left untouched.
         setChecked((prev) => {
           const next = new Set(prev);
-          visibleIds.forEach((id) => { if (next.has(id)) next.delete(id); else next.add(id); });
+          selectableIds.forEach((id) => { if (next.has(id)) next.delete(id); else next.add(id); });
           return next;
         });
-      }, [visibleIds]);
+      }, [selectableIds]);
 
       const runBatch = useCallback(async (ids, stopActivity) => {
         if (ids.length === 0 || busy !== null) return;
@@ -297,7 +340,8 @@ window.__ModuleLoader__.load({
         setNotice('');
       }, []);
 
-      const allChecked = visibleIds.length > 0 && checkedVisible.length === visibleIds.length;
+      const allChecked = selectableIds.length > 0
+        && selectableIds.every((id) => checked.has(id));
 
       return h('div', { className: 'bx-panel' }, [
         h('div', { key: 'head', className: 'bx-head' }, [
@@ -325,14 +369,16 @@ window.__ModuleLoader__.load({
           h('span', { key: 'count', className: 'bx-count' },
             checkedVisible.length > 0
               ? t('count.selected', { count: checkedVisible.length })
-              : t('count.none')),
+              : (rows.length > 0 && selectableIds.length === 0
+                  ? t('count.allBusy')
+                  : t('count.none'))),
           hiddenChecked > 0
             ? h('span', { key: 'hidden', className: 'bx-count', title: t('count.hiddenHint') },
                 t('count.hidden', { count: hiddenChecked }))
             : null,
           h('button', {
             key: 'all', type: 'button', className: 'bx-btn', onClick: selectAll,
-            disabled: rows.length === 0 || allChecked,
+            disabled: selectableIds.length === 0 || allChecked,
           }, t('action.selectAll')),
           h('button', {
             key: 'none', type: 'button', className: 'bx-btn', onClick: selectNone,
@@ -340,7 +386,7 @@ window.__ModuleLoader__.load({
           }, t('action.selectNone')),
           h('button', {
             key: 'inv', type: 'button', className: 'bx-btn', onClick: invert,
-            disabled: rows.length === 0,
+            disabled: selectableIds.length === 0,
           }, t('action.invert')),
           failed.size > 0
             ? h('button', { key: 'retry', type: 'button', className: 'bx-btn', onClick: retryFailed }, t('action.retry'))
@@ -417,6 +463,7 @@ window.__ModuleLoader__.load({
             'count.none': '点击左侧复选框选择会话',
             'count.hidden': '另有 {count} 个已选未显示',
             'count.hiddenHint': '这些勾选被当前的搜索或标签页遮住了，归档只作用于当前可见项',
+            'count.allBusy': '这些会话都在运行中，无法选择',
             'filter.search': '搜索标题或目录',
             'action.selectAll': '全选',
             'action.selectNone': '取消全选',
@@ -451,6 +498,8 @@ window.__ModuleLoader__.load({
             'row.running': '运行中',
             'row.blank': '新会话',
             'row.select': '选择会话：{name}',
+            'row.selectBusy': '运行中的会话无法选择：{name}',
+            'row.selectBusyHint': '会话正在运行，请等它结束后再归档',
             'row.updated': '更新于 {time}',
           },
           en: {
@@ -464,6 +513,7 @@ window.__ModuleLoader__.load({
             'count.none': 'Tick the checkbox to select sessions',
             'count.hidden': '+{count} selected but hidden',
             'count.hiddenHint': 'These ticked sessions are hidden by the current search or tab; archiving only affects visible rows',
+            'count.allBusy': 'Every session here is running and cannot be selected',
             'filter.search': 'Search title or directory',
             'action.selectAll': 'Select all',
             'action.selectNone': 'Clear',
@@ -498,6 +548,8 @@ window.__ModuleLoader__.load({
             'row.running': 'Running',
             'row.blank': 'New session',
             'row.select': 'Select session: {name}',
+            'row.selectBusy': 'Running session cannot be selected: {name}',
+            'row.selectBusyHint': 'This session is running; wait for it to finish before archiving',
             'row.updated': 'Updated {time}',
           },
         }), 'batch-archive: dictionaries');
